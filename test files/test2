@@ -1,0 +1,100 @@
+import ctypes
+import ctypes.wintypes as wintypes
+import threading
+import sys
+import time
+import signal
+
+# Define types and load DLLs.
+HWINEVENTHOOK = ctypes.c_void_p
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+# Define the callback type.
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None,
+    HWINEVENTHOOK,  # hWinEventHook
+    wintypes.DWORD,  # event
+    wintypes.HWND,  # hwnd
+    wintypes.LONG,  # idObject
+    wintypes.LONG,  # idChild
+    wintypes.DWORD,  # dwEventThread
+    wintypes.DWORD,  # dwmsEventTime
+)
+
+# Global state to track whether League is focused.
+league_focused = None
+
+
+def callback(
+    hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime
+):
+    global league_focused
+    buffer = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buffer, 512)
+    title = buffer.value
+
+    # Check if the foreground window is exactly "League of Legends (TM) Client".
+    if title == "League of Legends (TM) Client":
+        if league_focused != True:
+            print("Switched to League of Legends (TM) Client.")
+            league_focused = True
+    else:
+        if league_focused == True:
+            print("Switched from League of Legends (TM) Client.")
+            league_focused = False
+
+
+# Wrap the Python callback.
+wineventproc = WINEVENTPROC(callback)
+
+EVENT_SYSTEM_FOREGROUND = 0x0003  # Foreground window change event
+WINEVENT_OUTOFCONTEXT = 0x0000  # Out-of-context flag
+WINEVENT_SKIPOWNPROCESS = 0x0002  # Skip events from our own process
+
+dwFlags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+
+# Global variable to store the Windows thread ID for our message loop thread.
+message_loop_tid = None
+
+
+def message_loop_thread():
+    global message_loop_tid
+    # Get this thread's Windows thread ID.
+    message_loop_tid = kernel32.GetCurrentThreadId()
+    # Install the hook in this thread.
+    hook = user32.SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0, wineventproc, 0, 0, dwFlags
+    )
+    print("Hook handle in thread:", hook)
+    # Blocking message loop.
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+    print("Message loop thread exiting.")
+
+
+# Start the message loop thread.
+msg_thread = threading.Thread(target=message_loop_thread)
+msg_thread.start()
+
+
+# Signal handler to allow CTRL+C to terminate the script.
+def signal_handler(sig, frame):
+    print("CTRL+C pressed. Exiting...")
+    if message_loop_tid:
+        # WM_QUIT has the value 0x0012.
+        user32.PostThreadMessageW(message_loop_tid, 0x0012, 0, 0)
+    time.sleep(0.5)  # Give time for the thread to exit.
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# Main thread loop that remains alive.
+try:
+    while msg_thread.is_alive():
+        time.sleep(1)
+except KeyboardInterrupt:
+    signal_handler(None, None)

@@ -1,0 +1,1 @@
+pyinstaller --windowed --add-data "draw.png;." --icon="draw.ico" --name "CS Overlay" "CS_Overlay.py"

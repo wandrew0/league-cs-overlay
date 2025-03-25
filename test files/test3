@@ -1,0 +1,139 @@
+import tkinter as tk
+import ctypes
+import ctypes.wintypes as wintypes
+import threading
+import time
+import sys
+
+
+# ================= Tkinter Overlay (GUI) =================
+class LeagueOverlay:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.set_attributes()
+        self.build()
+        # Start hidden until League is focused.
+        self.root.withdraw()
+
+    def set_attributes(self):
+        self.root.wm_attributes("-fullscreen", True)
+        self.root.wm_attributes("-topmost", True)
+        self.root.wm_attributes("-alpha", 0.8)
+        self.root.wm_attributes("-transparentcolor", "#f0f0f0")
+
+    def build(self):
+        # Example widget: a label showing some text.
+        self.cs_per_minute_text = tk.StringVar(value="CS: 0")
+        self.font_size = 30
+        frame = tk.Frame(self.root, width=160, height=60, pady=60, padx=10)
+        frame.pack(side=tk.TOP, anchor=tk.NE)
+        label = tk.Label(
+            frame,
+            textvariable=self.cs_per_minute_text,
+            fg="white",
+            font=("Helvetica", self.font_size),
+        )
+        label.pack()
+
+    def show(self):
+        if self.root.state() != "normal":
+            print("Showing overlay.")
+            self.root.deiconify()
+
+    def hide(self):
+        if self.root.state() == "normal":
+            print("Hiding overlay.")
+            self.root.withdraw()
+
+    def mainloop(self):
+        self.root.mainloop()
+
+
+# ================= League Focus Detection =================
+# (Uses WinEventHook via ctypes)
+HWINEVENTHOOK = ctypes.c_void_p
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None,
+    HWINEVENTHOOK,  # hWinEventHook
+    wintypes.DWORD,  # event
+    wintypes.HWND,  # hwnd
+    wintypes.LONG,  # idObject
+    wintypes.LONG,  # idChild
+    wintypes.DWORD,  # dwEventThread
+    wintypes.DWORD,  # dwmsEventTime
+)
+
+# Global state to track league focus.
+league_focused = None
+# Global reference to the overlay instance.
+overlay_instance = None
+
+
+def callback(
+    hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime
+):
+    global league_focused, overlay_instance
+    buffer = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buffer, 512)
+    title = buffer.value
+    # Debug print: see every foreground change.
+    print(f"Callback fired: event={event}, hwnd={hwnd}, title='{title}'")
+
+    # When the foreground window is exactly the League client...
+    if title == "League of Legends (TM) Client":
+        if league_focused != True:
+            league_focused = True
+            if overlay_instance is not None:
+                # Schedule showing the overlay on the Tkinter thread.
+                overlay_instance.root.after(0, overlay_instance.show)
+    else:
+        if league_focused == True:
+            league_focused = False
+            if overlay_instance is not None:
+                # Schedule hiding the overlay.
+                overlay_instance.root.after(0, overlay_instance.hide)
+
+
+wineventproc = WINEVENTPROC(callback)
+
+# Constants for the event hook.
+EVENT_SYSTEM_FOREGROUND = 0x0003
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002
+dwFlags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+
+
+def detection_thread():
+    hook = user32.SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND,  # eventMin
+        EVENT_SYSTEM_FOREGROUND,  # eventMax
+        0,
+        wineventproc,
+        0,
+        0,
+        dwFlags,
+    )
+    print("Hook handle in detection thread:", hook)
+    # Blocking message loop: this thread receives the foreground change events.
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+    print("Detection thread exiting.")
+
+
+def start_detection(overlay):
+    global overlay_instance
+    overlay_instance = overlay
+    t = threading.Thread(target=detection_thread, daemon=True)
+    t.start()
+
+
+# ================= Main Program =================
+if __name__ == "__main__":
+    overlay = LeagueOverlay()
+    start_detection(overlay)
+    overlay.mainloop()
