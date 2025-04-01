@@ -65,15 +65,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 def gettime():
     """ Returns the time in seconds since the start of the game """
     try:
-        from CS_Overlay import league_focused  # adjust the import as needed
-    except ImportError:
-        league_focused = False
-
-    if not league_focused:
-        # Return a default value immediately if the game isn't open.
-        return 1
-
-    try:
         mins = requests.get(
             "https://127.0.0.1:2999/liveclientdata/gamestats", verify=False
         ).json()["gameTime"] / 60

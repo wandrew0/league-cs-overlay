@@ -103,7 +103,7 @@ def detection_callback(
             league_focused = True
             notifier.focusChanged.emit(True)
     else:
-        if league_focused != True:
+        if league_focused != False:
             league_focused = False
             notifier.focusChanged.emit(False)
 
@@ -196,7 +196,10 @@ class OverlayWindow(QWidget):
 
     def update_display(self):
         cs_value = self.ocr.get_cs()
-        current_time = gettime()
+        if league_focused:
+            current_time = gettime()
+        else:
+            current_time = 1
         minutes = int(current_time)
         seconds = int((current_time % 1) * 60)
         cs_per_min = cs_value / current_time if current_time > 0 else 0
@@ -204,7 +207,9 @@ class OverlayWindow(QWidget):
         if self.custom_format:
             try:
                 text = self.custom_format.format(
-                    cs=cs_value, time=f"{minutes}:{seconds:02d}", csmin=cs_per_min
+                    cs=cs_value,
+                    time=f"{minutes}:{seconds:02d}",
+                    csmin=f"{cs_per_min:.1f}",
                 )
             except Exception as e:
                 text = "Format error"
