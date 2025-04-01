@@ -308,6 +308,7 @@ def open_options(overlay):
     options_dialog.exec()
 
     overlay.force_visible = False
+    overlay.hideOverlay()
 
 
 # system tray and menu
