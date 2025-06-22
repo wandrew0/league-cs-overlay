@@ -110,6 +110,31 @@ def detection_callback(
 
 wineventproc = WINEVENTPROC(detection_callback)
 
+
+# Add a helper function to get the current foreground window title
+def get_foreground_window_title():
+    hwnd = user32.GetForegroundWindow()
+    buffer = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buffer, 512)
+    return buffer.value
+
+
+# Function to check if League is focused
+def check_league_focus():
+    global league_focused
+    title = get_foreground_window_title()
+    was_focused = league_focused
+
+    # Check if the title indicates League of Legends
+    is_league = title == "League of Legends (TM) Client"
+
+    # Only update and emit signals if the state has changed
+    if is_league != was_focused:
+        league_focused = is_league
+        print(f"Focus check: '{title}' - {'Focused' if is_league else 'Not focused'}")
+        notifier.focusChanged.emit(is_league)
+
+
 # Constants for the hook.
 EVENT_SYSTEM_FOREGROUND = 0x0003
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -393,12 +418,19 @@ def main():
         lambda focused: overlay.showOverlay() if focused else overlay.hideOverlay()
     )
 
+    # Set up the display update timer
     timer = QTimer()
     timer.setInterval(500)
     timer.timeout.connect(
         lambda: overlay.update_display() if overlay.isVisible() else None
     )
     timer.start()
+
+    # Add a second timer for periodic focus checking
+    focus_timer = QTimer()
+    focus_timer.setInterval(1000)  # Check every second
+    focus_timer.timeout.connect(check_league_focus)
+    focus_timer.start()
 
     tray = create_tray(app, overlay)
     overlay.tray = tray
