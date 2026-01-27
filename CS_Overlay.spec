@@ -5,7 +5,7 @@ a = Analysis(
     ['CS_Overlay.py'],
     pathex=[],
     binaries=[],
-    datas=[('draw.png', '.')],
+    datas=[('draw.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
