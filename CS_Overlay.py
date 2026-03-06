@@ -1,8 +1,11 @@
 import ctypes
 import ctypes.wintypes as wintypes
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
+import tempfile
 import threading
 
 from Stats import CSOCR, gettime
@@ -15,6 +18,13 @@ except Exception:
 
 icon_path = os.path.join(base_path, "draw.ico")
 config_path = os.path.join(base_path, "config.json")
+runtime_dir = (
+    os.path.dirname(sys.executable)
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
+)
+log_dir = runtime_dir if os.access(runtime_dir, os.W_OK) else tempfile.gettempdir()
+log_path = os.path.join(log_dir, "cs_overlay.log")
 
 
 user32 = ctypes.windll.user32
@@ -30,6 +40,26 @@ if not hasattr(wintypes, "UINT_PTR"):
     wintypes.UINT_PTR = (
         ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint
     )
+if not hasattr(wintypes, "HANDLE"):
+    wintypes.HANDLE = ctypes.c_void_p
+
+_handle_aliases = [
+    "HINSTANCE",
+    "HMODULE",
+    "HWND",
+    "HMENU",
+    "HICON",
+    "HCURSOR",
+    "HBRUSH",
+    "HBITMAP",
+    "HGDIOBJ",
+]
+for _handle_name in _handle_aliases:
+    if not hasattr(wintypes, _handle_name):
+        setattr(wintypes, _handle_name, wintypes.HANDLE)
+
+if not hasattr(wintypes, "COLORREF"):
+    wintypes.COLORREF = wintypes.DWORD
 
 user32.CreateWindowExW.restype = wintypes.HWND
 user32.CreateWindowExW.argtypes = [
@@ -80,9 +110,10 @@ WS_SYSMENU = 0x00080000
 SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
 
+HWND_TOPMOST = -1
+
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
-SWP_NOZORDER = 0x0004
 SWP_NOSENDCHANGING = 0x0400
 
 LWA_COLORKEY = 0x00000001
@@ -94,6 +125,10 @@ WM_CLOSE = 0x0010
 WM_NCHITTEST = 0x0084
 WM_CREATE = 0x0001
 WM_COMMAND = 0x0111
+WM_DISPLAYCHANGE = 0x007E
+WM_SETTINGCHANGE = 0x001A
+WM_DPICHANGED = 0x02E0
+WM_DWMCOMPOSITIONCHANGED = 0x031E
 
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
@@ -115,6 +150,10 @@ LEAGUE_PROCESS_NAMES = {"League of Legends.exe"}
 
 ID_TRAY_OPTIONS = 1001
 ID_TRAY_EXIT = 1002
+
+ERROR_ALREADY_EXISTS = 183
+MB_OK = 0x00000000
+MB_ICONINFORMATION = 0x00000040
 
 IMAGE_ICON = 1
 LR_LOADFROMFILE = 0x0010
@@ -257,8 +296,25 @@ user32.GetWindowThreadProcessId.argtypes = [
     ctypes.POINTER(wintypes.DWORD),
 ]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CreateMutexW.argtypes = [
+    ctypes.c_void_p,
+    wintypes.BOOL,
+    wintypes.LPCWSTR,
+]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.SetLastError.argtypes = [wintypes.DWORD]
+kernel32.SetLastError.restype = None
+kernel32.GetLastError.restype = wintypes.DWORD
+kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+kernel32.ReleaseMutex.restype = wintypes.BOOL
 kernel32.QueryFullProcessImageNameW.argtypes = [
     wintypes.HANDLE,
     wintypes.DWORD,
@@ -299,6 +355,13 @@ user32.SetWindowPos.argtypes = [
 user32.SetWindowPos.restype = wintypes.BOOL
 user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.ShowWindow.restype = wintypes.BOOL
+user32.MessageBoxW.argtypes = [
+    wintypes.HWND,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.UINT,
+]
+user32.MessageBoxW.restype = ctypes.c_int
 user32.PostMessageW.argtypes = [
     wintypes.HWND,
     wintypes.UINT,
@@ -403,6 +466,7 @@ gdi32.BitBlt.restype = wintypes.BOOL
 overlay_instance = None
 options_dialog = None
 league_focused = False
+single_instance_mutex = None
 
 options_bg_brush = user32.GetSysColorBrush(COLOR_BTNFACE)
 options_edit_brush = user32.GetSysColorBrush(COLOR_WINDOW)
@@ -414,6 +478,122 @@ user32.DefWindowProcW.argtypes = [
     wintypes.LPARAM,
 ]
 user32.DefWindowProcW.restype = wintypes.LRESULT
+
+
+def setup_logging():
+    logger = logging.getLogger("cs_overlay")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    handler = RotatingFileHandler(
+        log_path, maxBytes=512 * 1024, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.info(
+        "Logging started pid=%s frozen=%s runtime_dir=%s base_path=%s config_path=%s log_path=%s",
+        os.getpid(),
+        getattr(sys, "frozen", False),
+        runtime_dir,
+        base_path,
+        config_path,
+        log_path,
+    )
+    return logger
+
+
+logger = setup_logging()
+TASKBAR_CREATED = user32.RegisterWindowMessageW("TaskbarCreated")
+
+
+def format_last_error():
+    error_code = kernel32.GetLastError()
+    if not error_code:
+        return "0"
+    return f"{error_code} ({ctypes.FormatError(error_code).strip()})"
+
+
+def install_exception_logging():
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        logger.exception(
+            "Uncaught exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+
+    sys.excepthook = handle_exception
+
+    if hasattr(threading, "excepthook"):
+        def thread_exception_handler(args):
+            logger.exception(
+                "Unhandled thread exception in %s",
+                args.thread.name if args.thread else "unknown",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+
+        threading.excepthook = thread_exception_handler
+
+
+def get_window_state_summary(hwnd):
+    if not hwnd:
+        return "hwnd=0"
+
+    rect = RECT()
+    rect_text = "unknown"
+    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        rect_text = f"{rect.left},{rect.top},{rect.right},{rect.bottom}"
+
+    return (
+        f"hwnd=0x{int(hwnd):X} "
+        f"is_window={bool(user32.IsWindow(hwnd))} "
+        f"is_visible={bool(user32.IsWindowVisible(hwnd))} "
+        f"rect={rect_text}"
+    )
+
+
+def log_window_event(event, hwnd=None, **kwargs):
+    details = [get_window_state_summary(hwnd or (overlay_instance.hwnd if overlay_instance else 0))]
+    for key, value in kwargs.items():
+        details.append(f"{key}={value}")
+    logger.info("%s %s", event, " ".join(details))
+
+
+def ensure_single_instance():
+    global single_instance_mutex
+    kernel32.SetLastError(0)
+    mutex = kernel32.CreateMutexW(None, False, "Local\\CSOverlaySingleInstance")
+    if not mutex:
+        logger.warning("CreateMutexW failed last_error=%s", format_last_error())
+        return True
+
+    single_instance_mutex = mutex
+    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        logger.warning("Another CS Overlay instance is already running")
+        user32.MessageBoxW(
+            None,
+            "CS Overlay is already running. Check the system tray for the existing instance.",
+            "CS Overlay",
+            MB_OK | MB_ICONINFORMATION,
+        )
+        kernel32.CloseHandle(single_instance_mutex)
+        single_instance_mutex = None
+        return False
+
+    logger.info("Single-instance mutex acquired")
+    return True
+
+
+def release_single_instance():
+    global single_instance_mutex
+    if single_instance_mutex:
+        kernel32.ReleaseMutex(single_instance_mutex)
+        kernel32.CloseHandle(single_instance_mutex)
+        logger.info("Single-instance mutex released")
+        single_instance_mutex = None
 
 
 def set_dpi_awareness():
@@ -464,6 +644,7 @@ def update_focus_state(is_focused):
     global league_focused
     if is_focused != league_focused:
         league_focused = is_focused
+        logger.info("League focus changed focused=%s", is_focused)
         if overlay_instance and overlay_instance.hwnd:
             user32.PostMessageW(
                 overlay_instance.hwnd, WM_FOCUS_CHANGED, 1 if is_focused else 0, 0
@@ -479,6 +660,12 @@ def detection_callback(
     hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime
 ):
     if event == EVENT_SYSTEM_FOREGROUND:
+        logger.info(
+            "Foreground window changed hwnd=0x%X title=%r process=%r",
+            int(hwnd) if hwnd else 0,
+            get_window_title(hwnd),
+            get_process_name(hwnd),
+        )
         update_focus_state(is_league_window(hwnd))
 
 
@@ -486,6 +673,7 @@ win_event_proc = WINEVENTPROC(detection_callback)
 
 
 def detection_thread():
+    kernel32.SetLastError(0)
     hook = user32.SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND,
         EVENT_SYSTEM_FOREGROUND,
@@ -495,10 +683,16 @@ def detection_thread():
         0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
     )
+    if not hook:
+        logger.warning("SetWinEventHook failed last_error=%s", format_last_error())
     msg = wintypes.MSG()
-    while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+    result = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+    while result > 0:
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
+        result = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+    if result == -1:
+        logger.error("Detection thread GetMessageW failed last_error=%s", format_last_error())
     if hook:
         user32.UnhookWinEvent(hook)
 
@@ -524,6 +718,14 @@ class OverlayWindow:
         self.tray_icon = None
         self.tray_nid = None
         self.ocr = None
+        self.ex_style = (
+            WS_EX_LAYERED
+            | WS_EX_TRANSPARENT
+            | WS_EX_TOOLWINDOW
+            | WS_EX_TOPMOST
+            | WS_EX_NOACTIVATE
+        )
+        self.style = WS_POPUP
 
     def create_window(self):
         class_name = "CSOverlayWindow"
@@ -535,20 +737,12 @@ class OverlayWindow:
         wndclass.hCursor = user32.LoadCursorW(None, 32512)
         user32.RegisterClassW(ctypes.byref(wndclass))
 
-        ex_style = (
-            WS_EX_LAYERED
-            | WS_EX_TRANSPARENT
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_NOACTIVATE
-        )
-        style = WS_POPUP
-
+        kernel32.SetLastError(0)
         self.hwnd = user32.CreateWindowExW(
-            ex_style,
+            self.ex_style,
             class_name,
             "CS Overlay",
-            style,
+            self.style,
             self.x,
             self.y,
             self.width,
@@ -558,9 +752,65 @@ class OverlayWindow:
             hinst,
             None,
         )
-        user32.SetLayeredWindowAttributes(self.hwnd, rgb(0, 0, 0), 0, LWA_COLORKEY)
+        if not self.hwnd:
+            logger.error("CreateWindowExW failed last_error=%s", format_last_error())
+            raise ctypes.WinError()
+        log_window_event("Overlay window created", self.hwnd)
+        self.refresh_metrics()
+        self.refresh_window_state(show_window=False)
         self.update_font()
         self.hide()
+
+    def refresh_metrics(self):
+        old_width = self.width
+        old_height = self.height
+        self.width = user32.GetSystemMetrics(0)
+        self.height = user32.GetSystemMetrics(1)
+        if self.width != old_width or self.height != old_height:
+            logger.info(
+                "Screen metrics updated width=%s height=%s old_width=%s old_height=%s",
+                self.width,
+                self.height,
+                old_width,
+                old_height,
+            )
+
+    def refresh_window_state(self, show_window):
+        if not self.hwnd:
+            return
+        self.refresh_metrics()
+        kernel32.SetLastError(0)
+        if not user32.SetLayeredWindowAttributes(
+            self.hwnd, rgb(0, 0, 0), 0, LWA_COLORKEY
+        ):
+            logger.warning(
+                "SetLayeredWindowAttributes failed last_error=%s",
+                format_last_error(),
+            )
+        kernel32.SetLastError(0)
+        if not user32.SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            SWP_NOACTIVATE
+            | SWP_NOSENDCHANGING
+            | (SWP_SHOWWINDOW if show_window else 0),
+        ):
+            logger.warning("SetWindowPos failed last_error=%s", format_last_error())
+        log_window_event(
+            "Overlay window refreshed",
+            self.hwnd,
+            show_window=show_window,
+            force_visible=self.force_visible,
+            visible_flag=self.visible,
+            width=self.width,
+            height=self.height,
+            x=self.x,
+            y=self.y,
+        )
 
     def update_font(self):
         if self.font:
@@ -577,30 +827,26 @@ class OverlayWindow:
         lf.lfQuality = 5
         lf.lfFaceName = "Segoe UI"
         self.font = gdi32.CreateFontIndirectW(ctypes.byref(lf))
+        if not self.font:
+            logger.warning("CreateFontIndirectW failed last_error=%s", format_last_error())
+        else:
+            logger.info("Overlay font updated font_size=%s dpi=%s", self.font_size, dpi)
 
     def update_position(self):
-        user32.SetWindowPos(
-            self.hwnd,
-            None,
-            self.x,
-            self.y,
-            self.width,
-            self.height,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-        )
+        self.refresh_window_state(show_window=self.visible or self.force_visible)
 
     def show(self):
         self.visible = True
-        user32.SetWindowPos(
-            self.hwnd,
-            None,
-            self.x,
-            self.y,
-            self.width,
-            self.height,
-            SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-        )
+        self.refresh_window_state(show_window=True)
+        kernel32.SetLastError(0)
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+        log_window_event(
+            "Overlay show requested",
+            self.hwnd,
+            force_visible=self.force_visible,
+            league_focused=league_focused,
+        )
+        self.update_display()
 
     def apply_timers(self):
         if not self.hwnd:
@@ -611,9 +857,16 @@ class OverlayWindow:
         user32.SetTimer(self.hwnd, TIMER_FOCUS_POLL, self.focus_poll_interval_ms, None)
 
     def hide(self):
-        if self.visible and not self.force_visible:
-            user32.ShowWindow(self.hwnd, SW_HIDE)
+        if not self.force_visible:
             self.visible = False
+            kernel32.SetLastError(0)
+            user32.ShowWindow(self.hwnd, SW_HIDE)
+            log_window_event(
+                "Overlay hide requested",
+                self.hwnd,
+                force_visible=self.force_visible,
+                league_focused=league_focused,
+            )
 
     def update_display(self):
         if not self.ocr:
@@ -645,7 +898,8 @@ class OverlayWindow:
 
         self.text = text
         if self.visible or self.force_visible:
-            user32.InvalidateRect(self.hwnd, None, True)
+            if not user32.InvalidateRect(self.hwnd, None, True):
+                logger.warning("InvalidateRect failed last_error=%s", format_last_error())
 
     def on_timer(self, timer_id):
         if timer_id == TIMER_UPDATE:
@@ -654,10 +908,21 @@ class OverlayWindow:
         elif timer_id == TIMER_FOCUS_POLL:
             check_league_focus()
 
+    def handle_system_change(self, reason):
+        logger.info("System change received reason=%s", reason)
+        self.refresh_metrics()
+        self.update_font()
+        if self.visible or self.force_visible:
+            self.refresh_window_state(show_window=True)
+            self.update_display()
+        else:
+            self.refresh_window_state(show_window=False)
+
     def on_paint(self):
         ps = PAINTSTRUCT()
         hdc = user32.BeginPaint(self.hwnd, ctypes.byref(ps))
         if not hdc:
+            logger.warning("BeginPaint returned null last_error=%s", format_last_error())
             return
         memdc = gdi32.CreateCompatibleDC(hdc)
         bmp = gdi32.CreateCompatibleBitmap(hdc, self.width, self.height)
@@ -1011,9 +1276,11 @@ class OptionsDialog:
 def open_options():
     global options_dialog
     if options_dialog and options_dialog.hwnd and user32.IsWindow(options_dialog.hwnd):
+        logger.info("Options already open; foregrounding existing dialog")
         user32.SetForegroundWindow(options_dialog.hwnd)
         return
     overlay_instance.force_visible = True
+    logger.info("Opening options dialog and forcing overlay visible")
     overlay_instance.show()
     options_dialog = OptionsDialog(overlay_instance)
     options_dialog.create()
@@ -1021,6 +1288,11 @@ def open_options():
 
 @WNDPROC
 def overlay_wndproc(hwnd, msg, wparam, lparam):
+    if msg == TASKBAR_CREATED:
+        logger.info("TaskbarCreated received; recreating tray icon")
+        overlay_instance.remove_tray()
+        overlay_instance.create_tray()
+        return 0
     if msg == WM_PAINT:
         overlay_instance.on_paint()
         return 0
@@ -1059,6 +1331,15 @@ def overlay_wndproc(hwnd, msg, wparam, lparam):
             overlay_instance.show()
         else:
             overlay_instance.hide()
+        return 0
+    if msg in (WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE, WM_DWMCOMPOSITIONCHANGED):
+        message_name = {
+            WM_DISPLAYCHANGE: "WM_DISPLAYCHANGE",
+            WM_DPICHANGED: "WM_DPICHANGED",
+            WM_SETTINGCHANGE: "WM_SETTINGCHANGE",
+            WM_DWMCOMPOSITIONCHANGED: "WM_DWMCOMPOSITIONCHANGED",
+        }.get(msg, str(msg))
+        overlay_instance.handle_system_change(message_name)
         return 0
     if msg == WM_CLOSE:
         user32.DestroyWindow(hwnd)
@@ -1131,10 +1412,14 @@ def save_config(config):
 
 def main():
     set_dpi_awareness()
+    install_exception_logging()
+    if not ensure_single_instance():
+        return
     global overlay_instance
     overlay_instance = OverlayWindow()
     overlay_instance.create_window()
     overlay_instance.ocr = CSOCR()
+    logger.info("Overlay OCR initialized")
 
     config = load_config()
     overlay_instance.x = config.get("x", overlay_instance.x)
@@ -1159,18 +1444,30 @@ def main():
     overlay_instance.update_font()
 
     overlay_instance.create_tray()
+    logger.info("Tray icon created")
 
     overlay_instance.apply_timers()
+    logger.info(
+        "Timers applied update_interval_ms=%s focus_poll_interval_ms=%s",
+        overlay_instance.update_interval_ms,
+        overlay_instance.focus_poll_interval_ms,
+    )
 
-    t = threading.Thread(target=detection_thread, daemon=True)
+    t = threading.Thread(target=detection_thread, daemon=True, name="focus-detection")
     t.start()
+    logger.info("Focus detection thread started")
 
     check_league_focus()
 
     msg = wintypes.MSG()
-    while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+    result = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+    while result > 0:
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
+        result = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+    if result == -1:
+        logger.error("Main loop GetMessageW failed last_error=%s", format_last_error())
+    release_single_instance()
 
     config = {
         "x": overlay_instance.x,

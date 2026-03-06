@@ -1,3 +1,7 @@
-build
-dist
-__pycache__
+__pycache__/
+*.py[cod]
+*.pyc.*
+.ruff_cache/
+build/
+dist/
+cs_overlay.log
