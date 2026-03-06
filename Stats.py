@@ -1,18 +1,45 @@
 import ctypes
 import ctypes.wintypes as wintypes
 import json
-import ssl
-import urllib.request
+import logging
 
 from digits import TARGET_DIGITS
 
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
+winhttp = ctypes.windll.winhttp
+
+logger = logging.getLogger("cs_overlay")
 
 SRCCOPY = 0x00CC0020
 BI_RGB = 0
 DIB_RGB_COLORS = 0
+
+WINHTTP_ACCESS_TYPE_NO_PROXY = 1
+WINHTTP_NO_PROXY_NAME = None
+WINHTTP_NO_PROXY_BYPASS = None
+WINHTTP_NO_REFERER = None
+WINHTTP_DEFAULT_ACCEPT_TYPES = ctypes.POINTER(wintypes.LPCWSTR)()
+WINHTTP_FLAG_SECURE = 0x00800000
+WINHTTP_OPTION_SECURITY_FLAGS = 31
+
+SECURITY_FLAG_IGNORE_UNKNOWN_CA = 0x00000100
+SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE = 0x00000200
+SECURITY_FLAG_IGNORE_CERT_CN_INVALID = 0x00001000
+SECURITY_FLAG_IGNORE_CERT_DATE_INVALID = 0x00002000
+
+WINHTTP_SECURITY_FLAGS = (
+    SECURITY_FLAG_IGNORE_UNKNOWN_CA
+    | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE
+    | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+    | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+)
+
+logger = logging.getLogger("cs_overlay")
+
+_winhttp_session = None
+_winhttp_connection = None
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -71,6 +98,65 @@ gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
 gdi32.DeleteObject.restype = wintypes.BOOL
 gdi32.DeleteDC.argtypes = [wintypes.HDC]
 gdi32.DeleteDC.restype = wintypes.BOOL
+
+winhttp.WinHttpOpen.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+]
+winhttp.WinHttpOpen.restype = wintypes.HANDLE
+winhttp.WinHttpConnect.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCWSTR,
+    wintypes.WORD,
+    wintypes.DWORD,
+]
+winhttp.WinHttpConnect.restype = wintypes.HANDLE
+winhttp.WinHttpOpenRequest.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    ctypes.POINTER(wintypes.LPCWSTR),
+    wintypes.DWORD,
+]
+winhttp.WinHttpOpenRequest.restype = wintypes.HANDLE
+winhttp.WinHttpSetOption.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+]
+winhttp.WinHttpSetOption.restype = wintypes.BOOL
+winhttp.WinHttpSendRequest.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+]
+winhttp.WinHttpSendRequest.restype = wintypes.BOOL
+winhttp.WinHttpReceiveResponse.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+winhttp.WinHttpReceiveResponse.restype = wintypes.BOOL
+winhttp.WinHttpQueryDataAvailable.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.DWORD),
+]
+winhttp.WinHttpQueryDataAvailable.restype = wintypes.BOOL
+winhttp.WinHttpReadData.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+]
+winhttp.WinHttpReadData.restype = wintypes.BOOL
+winhttp.WinHttpCloseHandle.argtypes = [wintypes.HANDLE]
+winhttp.WinHttpCloseHandle.restype = wintypes.BOOL
 
 
 def capture_grayscale(left, top, width, height):
@@ -183,14 +269,92 @@ class CSOCR:
         return str(min_index) if min_index != 10 else ""
 
 
+def _ensure_winhttp_handles():
+    global _winhttp_session, _winhttp_connection
+    if not _winhttp_session:
+        _winhttp_session = winhttp.WinHttpOpen(
+            "CS Overlay/1.0",
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            0,
+        )
+    if _winhttp_session and not _winhttp_connection:
+        _winhttp_connection = winhttp.WinHttpConnect(
+            _winhttp_session, "127.0.0.1", 2999, 0
+        )
+    return _winhttp_session and _winhttp_connection
+
+
+def _close_winhttp_handles():
+    global _winhttp_session, _winhttp_connection
+    if _winhttp_connection:
+        winhttp.WinHttpCloseHandle(_winhttp_connection)
+        _winhttp_connection = None
+    if _winhttp_session:
+        winhttp.WinHttpCloseHandle(_winhttp_session)
+        _winhttp_session = None
+
+
 def gettime():
-    """Returns the time in seconds since the start of the game"""
-    try:
-        ctx = ssl._create_unverified_context()
-        with urllib.request.urlopen(
-            "https://127.0.0.1:2999/liveclientdata/gamestats", context=ctx, timeout=0.2
-        ) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        return payload.get("gameTime", 0) / 60
-    except Exception:
+    """Returns the time in minutes since the start of the game"""
+    if not _ensure_winhttp_handles():
         return 1
+
+    request = None
+    try:
+        request = winhttp.WinHttpOpenRequest(
+            _winhttp_connection,
+            "GET",
+            "/liveclientdata/gamestats",
+            None,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE,
+        )
+        if not request:
+            return 1
+
+        security_flags = wintypes.DWORD(WINHTTP_SECURITY_FLAGS)
+        winhttp.WinHttpSetOption(
+            request,
+            WINHTTP_OPTION_SECURITY_FLAGS,
+            ctypes.byref(security_flags),
+            ctypes.sizeof(security_flags),
+        )
+
+        if not winhttp.WinHttpSendRequest(request, None, 0, None, 0, 0, None):
+            _close_winhttp_handles()
+            return 1
+        if not winhttp.WinHttpReceiveResponse(request, None):
+            _close_winhttp_handles()
+            return 1
+
+        chunks = bytearray()
+        available = wintypes.DWORD()
+        bytes_read = wintypes.DWORD()
+        while True:
+            available.value = 0
+            if not winhttp.WinHttpQueryDataAvailable(request, ctypes.byref(available)):
+                _close_winhttp_handles()
+                return 1
+            if not available.value:
+                break
+            buffer = ctypes.create_string_buffer(available.value)
+            bytes_read.value = 0
+            if not winhttp.WinHttpReadData(
+                request, buffer, available.value, ctypes.byref(bytes_read)
+            ):
+                _close_winhttp_handles()
+                return 1
+            chunks.extend(buffer.raw[: bytes_read.value])
+
+        payload = json.loads(chunks.decode("utf-8"))
+        return payload.get("gameTime", 0) / 60
+    except Exception as exc:
+        logger.debug("WinHTTP game time request failed: %s", exc)
+        _close_winhttp_handles()
+        return 1
+    finally:
+        if request:
+            winhttp.WinHttpCloseHandle(request)

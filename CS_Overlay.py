@@ -2,11 +2,10 @@ import ctypes
 import ctypes.wintypes as wintypes
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import sys
-import tempfile
 import threading
+import time
 
 from Stats import CSOCR, gettime
 
@@ -23,7 +22,13 @@ runtime_dir = (
     if getattr(sys, "frozen", False)
     else os.path.dirname(os.path.abspath(__file__))
 )
-log_dir = runtime_dir if os.access(runtime_dir, os.W_OK) else tempfile.gettempdir()
+fallback_log_dir = (
+    os.environ.get("LOCALAPPDATA")
+    or os.environ.get("TEMP")
+    or os.environ.get("TMP")
+    or runtime_dir
+)
+log_dir = runtime_dir if os.access(runtime_dir, os.W_OK) else fallback_log_dir
 log_path = os.path.join(log_dir, "cs_overlay.log")
 
 
@@ -40,26 +45,6 @@ if not hasattr(wintypes, "UINT_PTR"):
     wintypes.UINT_PTR = (
         ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint
     )
-if not hasattr(wintypes, "HANDLE"):
-    wintypes.HANDLE = ctypes.c_void_p
-
-_handle_aliases = [
-    "HINSTANCE",
-    "HMODULE",
-    "HWND",
-    "HMENU",
-    "HICON",
-    "HCURSOR",
-    "HBRUSH",
-    "HBITMAP",
-    "HGDIOBJ",
-]
-for _handle_name in _handle_aliases:
-    if not hasattr(wintypes, _handle_name):
-        setattr(wintypes, _handle_name, wintypes.HANDLE)
-
-if not hasattr(wintypes, "COLORREF"):
-    wintypes.COLORREF = wintypes.DWORD
 
 user32.CreateWindowExW.restype = wintypes.HWND
 user32.CreateWindowExW.argtypes = [
@@ -94,6 +79,7 @@ def rgb(r, g, b):
 
 
 GWL_EXSTYLE = -20
+GWL_STYLE = -16
 SRCCOPY = 0x00CC0020
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
@@ -140,6 +126,8 @@ HTTRANSPARENT = -1
 
 TIMER_UPDATE = 1
 TIMER_FOCUS_POLL = 2
+TIMER_POST_SHOW_CHECK = 3
+POST_SHOW_CHECK_MS = 250
 
 EVENT_SYSTEM_FOREGROUND = 0x0003
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -189,6 +177,7 @@ ES_WANTRETURN = 0x1000
 DT_RIGHT = 0x0002
 DT_TOP = 0x0000
 DT_NOPREFIX = 0x0800
+DT_CALCRECT = 0x0400
 
 
 class NOTIFYICONDATA(ctypes.Structure):
@@ -291,6 +280,10 @@ user32.GetWindowTextW.restype = ctypes.c_int
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetDC.argtypes = [wintypes.HWND]
+user32.GetDC.restype = wintypes.HDC
+user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+user32.ReleaseDC.restype = ctypes.c_int
 user32.GetWindowThreadProcessId.argtypes = [
     wintypes.HWND,
     ctypes.POINTER(wintypes.DWORD),
@@ -298,10 +291,14 @@ user32.GetWindowThreadProcessId.argtypes = [
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+user32.GetClientRect.restype = wintypes.BOOL
 user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindow.restype = wintypes.BOOL
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.IsWindowVisible.restype = wintypes.BOOL
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = wintypes.LONG
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.CreateMutexW.argtypes = [
@@ -480,6 +477,48 @@ user32.DefWindowProcW.argtypes = [
 user32.DefWindowProcW.restype = wintypes.LRESULT
 
 
+class SizeRotatingFileHandler(logging.FileHandler):
+    def __init__(self, filename, max_bytes, backup_count, encoding="utf-8"):
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        super().__init__(filename, mode="a", encoding=encoding)
+
+    def emit(self, record):
+        if self.should_rollover(record):
+            self.do_rollover()
+        super().emit(record)
+
+    def should_rollover(self, record):
+        if self.max_bytes <= 0:
+            return False
+        if self.stream is None:
+            self.stream = self._open()
+        message = f"{self.format(record)}{self.terminator}"
+        self.stream.seek(0, os.SEEK_END)
+        return self.stream.tell() + len(message.encode(self.encoding or "utf-8")) >= self.max_bytes
+
+    def do_rollover(self):
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        for index in range(self.backup_count - 1, 0, -1):
+            src = f"{self.baseFilename}.{index}"
+            dst = f"{self.baseFilename}.{index + 1}"
+            if os.path.exists(src):
+                if os.path.exists(dst):
+                    os.remove(dst)
+                os.replace(src, dst)
+
+        first_backup = f"{self.baseFilename}.1"
+        if os.path.exists(first_backup):
+            os.remove(first_backup)
+        if os.path.exists(self.baseFilename):
+            os.replace(self.baseFilename, first_backup)
+
+        self.stream = self._open()
+
+
 def setup_logging():
     logger = logging.getLogger("cs_overlay")
     if logger.handlers:
@@ -488,8 +527,8 @@ def setup_logging():
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    handler = RotatingFileHandler(
-        log_path, maxBytes=512 * 1024, backupCount=3, encoding="utf-8"
+    handler = SizeRotatingFileHandler(
+        log_path, max_bytes=512 * 1024, backup_count=3, encoding="utf-8"
     )
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(message)s")
@@ -553,6 +592,25 @@ def get_window_state_summary(hwnd):
         f"is_visible={bool(user32.IsWindowVisible(hwnd))} "
         f"rect={rect_text}"
     )
+
+
+def get_rect_summary(hwnd, client=False):
+    if not hwnd:
+        return "unknown"
+    rect = RECT()
+    getter = user32.GetClientRect if client else user32.GetWindowRect
+    if not getter(hwnd, ctypes.byref(rect)):
+        return "unknown"
+    return f"{rect.left},{rect.top},{rect.right},{rect.bottom}"
+
+
+def get_foreground_window_summary():
+    hwnd = user32.GetForegroundWindow()
+    return {
+        "hwnd": f"0x{int(hwnd):X}" if hwnd else "0x0",
+        "title": get_window_title(hwnd),
+        "process": get_process_name(hwnd),
+    }
 
 
 def log_window_event(event, hwnd=None, **kwargs):
@@ -713,11 +771,20 @@ class OverlayWindow:
         self.text = ""
         self.x = -10
         self.y = 60
-        self.width = user32.GetSystemMetrics(0)
-        self.height = user32.GetSystemMetrics(1)
+        self.width = 1
+        self.height = 1
+        self.screen_width = user32.GetSystemMetrics(0)
+        self.screen_height = user32.GetSystemMetrics(1)
+        self.padding_x = 12
+        self.padding_y = 6
         self.tray_icon = None
         self.tray_nid = None
         self.ocr = None
+        self.last_paint_monotonic = 0.0
+        self.last_show_monotonic = 0.0
+        self.last_show_reason = "startup"
+        self.last_hide_reason = "startup"
+        self.last_snapshot_monotonic = 0.0
         self.ex_style = (
             WS_EX_LAYERED
             | WS_EX_TRANSPARENT
@@ -726,6 +793,106 @@ class OverlayWindow:
             | WS_EX_NOACTIVATE
         )
         self.style = WS_POPUP
+
+    def expected_visible(self):
+        return self.visible or self.force_visible
+
+    def schedule_post_show_check(self):
+        if not self.hwnd:
+            return
+        user32.KillTimer(self.hwnd, TIMER_POST_SHOW_CHECK)
+        user32.SetTimer(self.hwnd, TIMER_POST_SHOW_CHECK, POST_SHOW_CHECK_MS, None)
+
+    def _describe_suspicious_state(self):
+        reasons = []
+        if not self.hwnd or not user32.IsWindow(self.hwnd):
+            reasons.append("invalid_hwnd")
+            return reasons
+
+        if self.expected_visible() and not user32.IsWindowVisible(self.hwnd):
+            reasons.append("expected_visible_but_hidden")
+
+        if self.width <= 0 or self.height <= 0:
+            reasons.append("non_positive_layout")
+
+        rect = RECT()
+        if user32.GetWindowRect(self.hwnd, ctypes.byref(rect)):
+            if rect.right <= rect.left or rect.bottom <= rect.top:
+                reasons.append("empty_window_rect")
+            if (
+                rect.right <= 0
+                or rect.bottom <= 0
+                or rect.left >= self.screen_width
+                or rect.top >= self.screen_height
+            ):
+                reasons.append("window_rect_offscreen")
+
+        ex_style = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        if not (ex_style & WS_EX_LAYERED):
+            reasons.append("missing_layered_style")
+        if not (ex_style & WS_EX_TOPMOST):
+            reasons.append("missing_topmost_style")
+
+        if self.expected_visible() and self.last_show_monotonic:
+            if self.last_paint_monotonic < self.last_show_monotonic:
+                reasons.append("no_paint_since_show")
+
+        return reasons
+
+    def log_state_snapshot(self, reason, level=logging.INFO):
+        if not self.hwnd:
+            logger.log(level, "Overlay snapshot reason=%s hwnd=0", reason)
+            return
+
+        now = time.monotonic()
+        if level < logging.WARNING and now - self.last_snapshot_monotonic < 1.0:
+            return
+        self.last_snapshot_monotonic = now
+
+        foreground = get_foreground_window_summary()
+        last_paint_age_ms = (
+            int((now - self.last_paint_monotonic) * 1000)
+            if self.last_paint_monotonic
+            else -1
+        )
+        text_preview = self.text.replace("\r", "\\r").replace("\n", "\\n")
+        text_preview = text_preview[:80]
+
+        logger.log(
+            level,
+            "Overlay snapshot reason=%s expected_visible=%s visible_flag=%s force_visible=%s "
+            "window_visible=%s window_rect=%s client_rect=%s layout=%sx%s screen=%sx%s "
+            "ex_style=0x%X style=0x%X text=%r last_paint_age_ms=%s league_focused=%s "
+            "last_show_reason=%s last_hide_reason=%s foreground_hwnd=%s foreground_title=%r foreground_process=%r",
+            reason,
+            self.expected_visible(),
+            self.visible,
+            self.force_visible,
+            bool(user32.IsWindowVisible(self.hwnd)),
+            get_rect_summary(self.hwnd),
+            get_rect_summary(self.hwnd, client=True),
+            self.width,
+            self.height,
+            self.screen_width,
+            self.screen_height,
+            user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE) & 0xFFFFFFFF,
+            user32.GetWindowLongW(self.hwnd, GWL_STYLE) & 0xFFFFFFFF,
+            text_preview,
+            last_paint_age_ms,
+            league_focused,
+            self.last_show_reason,
+            self.last_hide_reason,
+            foreground["hwnd"],
+            foreground["title"],
+            foreground["process"],
+        )
+
+    def log_snapshot_if_suspicious(self, reason, level=logging.WARNING):
+        reasons = self._describe_suspicious_state()
+        if reasons:
+            self.log_state_snapshot(f"{reason} suspicious={','.join(reasons)}", level=level)
+            return True
+        return False
 
     def create_window(self):
         class_name = "CSOverlayWindow"
@@ -757,28 +924,57 @@ class OverlayWindow:
             raise ctypes.WinError()
         log_window_event("Overlay window created", self.hwnd)
         self.refresh_metrics()
+        self.update_layout()
         self.refresh_window_state(show_window=False)
         self.update_font()
         self.hide()
 
     def refresh_metrics(self):
-        old_width = self.width
-        old_height = self.height
-        self.width = user32.GetSystemMetrics(0)
-        self.height = user32.GetSystemMetrics(1)
-        if self.width != old_width or self.height != old_height:
+        old_width = self.screen_width
+        old_height = self.screen_height
+        self.screen_width = user32.GetSystemMetrics(0)
+        self.screen_height = user32.GetSystemMetrics(1)
+        if self.screen_width != old_width or self.screen_height != old_height:
             logger.info(
                 "Screen metrics updated width=%s height=%s old_width=%s old_height=%s",
-                self.width,
-                self.height,
+                self.screen_width,
+                self.screen_height,
                 old_width,
                 old_height,
             )
+
+    def _get_window_origin(self):
+        return self.screen_width + self.x - self.width, self.y
+
+    def update_layout(self):
+        text = self.text if self.text else " "
+        hdc = user32.GetDC(self.hwnd)
+        if not hdc:
+            return
+        memdc = gdi32.CreateCompatibleDC(hdc)
+        old_font = None
+        if self.font:
+            old_font = gdi32.SelectObject(memdc, self.font)
+
+        rect = RECT(0, 0, 0, 0)
+        user32.DrawTextW(memdc, text, -1, ctypes.byref(rect), DT_TOP | DT_NOPREFIX | DT_CALCRECT)
+
+        if old_font:
+            gdi32.SelectObject(memdc, old_font)
+        gdi32.DeleteDC(memdc)
+        user32.ReleaseDC(self.hwnd, hdc)
+
+        text_width = max(1, rect.right - rect.left)
+        text_height = max(1, rect.bottom - rect.top)
+        self.width = text_width + self.padding_x
+        self.height = text_height + self.padding_y
 
     def refresh_window_state(self, show_window):
         if not self.hwnd:
             return
         self.refresh_metrics()
+        self.update_layout()
+        window_x, window_y = self._get_window_origin()
         kernel32.SetLastError(0)
         if not user32.SetLayeredWindowAttributes(
             self.hwnd, rgb(0, 0, 0), 0, LWA_COLORKEY
@@ -787,12 +983,13 @@ class OverlayWindow:
                 "SetLayeredWindowAttributes failed last_error=%s",
                 format_last_error(),
             )
+            self.log_state_snapshot("SetLayeredWindowAttributes_failed", level=logging.WARNING)
         kernel32.SetLastError(0)
         if not user32.SetWindowPos(
             self.hwnd,
             HWND_TOPMOST,
-            self.x,
-            self.y,
+            window_x,
+            window_y,
             self.width,
             self.height,
             SWP_NOACTIVATE
@@ -800,6 +997,7 @@ class OverlayWindow:
             | (SWP_SHOWWINDOW if show_window else 0),
         ):
             logger.warning("SetWindowPos failed last_error=%s", format_last_error())
+            self.log_state_snapshot("SetWindowPos_failed", level=logging.WARNING)
         log_window_event(
             "Overlay window refreshed",
             self.hwnd,
@@ -808,8 +1006,9 @@ class OverlayWindow:
             visible_flag=self.visible,
             width=self.width,
             height=self.height,
-            x=self.x,
-            y=self.y,
+            x=window_x,
+            y=window_y,
+            right_offset=self.x,
         )
 
     def update_font(self):
@@ -831,12 +1030,15 @@ class OverlayWindow:
             logger.warning("CreateFontIndirectW failed last_error=%s", format_last_error())
         else:
             logger.info("Overlay font updated font_size=%s dpi=%s", self.font_size, dpi)
+        self.update_layout()
 
     def update_position(self):
         self.refresh_window_state(show_window=self.visible or self.force_visible)
 
     def show(self):
         self.visible = True
+        self.last_show_monotonic = time.monotonic()
+        self.last_show_reason = "show"
         self.refresh_window_state(show_window=True)
         kernel32.SetLastError(0)
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
@@ -846,6 +1048,7 @@ class OverlayWindow:
             force_visible=self.force_visible,
             league_focused=league_focused,
         )
+        self.schedule_post_show_check()
         self.update_display()
 
     def apply_timers(self):
@@ -857,6 +1060,8 @@ class OverlayWindow:
         user32.SetTimer(self.hwnd, TIMER_FOCUS_POLL, self.focus_poll_interval_ms, None)
 
     def hide(self):
+        self.last_hide_reason = "hide"
+        user32.KillTimer(self.hwnd, TIMER_POST_SHOW_CHECK)
         if not self.force_visible:
             self.visible = False
             kernel32.SetLastError(0)
@@ -897,9 +1102,14 @@ class OverlayWindow:
             text = "\n".join(lines)
 
         self.text = text
+        self.update_layout()
+        if self.visible or self.force_visible:
+            self.refresh_window_state(show_window=True)
+            self.schedule_post_show_check()
         if self.visible or self.force_visible:
             if not user32.InvalidateRect(self.hwnd, None, True):
                 logger.warning("InvalidateRect failed last_error=%s", format_last_error())
+                self.log_state_snapshot("InvalidateRect_failed", level=logging.WARNING)
 
     def on_timer(self, timer_id):
         if timer_id == TIMER_UPDATE:
@@ -907,6 +1117,9 @@ class OverlayWindow:
                 self.update_display()
         elif timer_id == TIMER_FOCUS_POLL:
             check_league_focus()
+        elif timer_id == TIMER_POST_SHOW_CHECK:
+            user32.KillTimer(self.hwnd, TIMER_POST_SHOW_CHECK)
+            self.log_snapshot_if_suspicious("post_show_check")
 
     def handle_system_change(self, reason):
         logger.info("System change received reason=%s", reason)
@@ -914,6 +1127,7 @@ class OverlayWindow:
         self.update_font()
         if self.visible or self.force_visible:
             self.refresh_window_state(show_window=True)
+            self.schedule_post_show_check()
             self.update_display()
         else:
             self.refresh_window_state(show_window=False)
@@ -923,29 +1137,24 @@ class OverlayWindow:
         hdc = user32.BeginPaint(self.hwnd, ctypes.byref(ps))
         if not hdc:
             logger.warning("BeginPaint returned null last_error=%s", format_last_error())
+            self.log_state_snapshot("BeginPaint_failed", level=logging.WARNING)
             return
-        memdc = gdi32.CreateCompatibleDC(hdc)
-        bmp = gdi32.CreateCompatibleBitmap(hdc, self.width, self.height)
-        old_bmp = gdi32.SelectObject(memdc, bmp)
-
+        self.last_paint_monotonic = time.monotonic()
         rect = RECT(0, 0, self.width, self.height)
         brush = gdi32.CreateSolidBrush(rgb(0, 0, 0))
-        user32.FillRect(memdc, ctypes.byref(rect), brush)
+        user32.FillRect(hdc, ctypes.byref(rect), brush)
         gdi32.DeleteObject(brush)
 
         if self.font:
-            gdi32.SelectObject(memdc, self.font)
-        gdi32.SetBkMode(memdc, 1)
-        gdi32.SetTextColor(memdc, rgb(255, 255, 255))
+            gdi32.SelectObject(hdc, self.font)
+        gdi32.SetBkMode(hdc, 1)
+        gdi32.SetTextColor(hdc, rgb(255, 255, 255))
 
+        inset_x = int(self.padding_x / 2)
+        inset_y = int(self.padding_y / 2)
+        text_rect = RECT(inset_x, inset_y, self.width - inset_x, self.height - inset_y)
         flags = DT_RIGHT | DT_TOP | DT_NOPREFIX
-        user32.DrawTextW(memdc, self.text, -1, ctypes.byref(rect), flags)
-
-        gdi32.BitBlt(hdc, 0, 0, self.width, self.height, memdc, 0, 0, SRCCOPY)
-
-        gdi32.SelectObject(memdc, old_bmp)
-        gdi32.DeleteObject(bmp)
-        gdi32.DeleteDC(memdc)
+        user32.DrawTextW(hdc, self.text, -1, ctypes.byref(text_rect), flags)
         user32.EndPaint(self.hwnd, ctypes.byref(ps))
 
     def create_tray(self):
