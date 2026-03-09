@@ -207,7 +207,7 @@ class CSOCR:
     def get_cs(self, debug=False) -> int:
         screen_width = user32.GetSystemMetrics(0)
         left = screen_width - 138
-        top = 5
+        top = 6
         right = screen_width - 108
         bottom = 25
         width = right - left

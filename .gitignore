@@ -5,4 +5,5 @@ __pycache__/
 build/
 dist/
 cs_overlay.log
+ocr_watch.log
 .vscode/
