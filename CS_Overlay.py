@@ -98,6 +98,29 @@ SW_SHOWNOACTIVATE = 4
 
 HWND_TOPMOST = -1
 
+BASE_SCREEN_HEIGHT = 1080
+
+
+def parse_float_setting(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def format_number_setting(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(number)) if number.is_integer() else f"{number:g}"
+
+
+def normalize_number_setting(value):
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_NOSENDCHANGING = 0x0400
@@ -176,6 +199,8 @@ ES_WANTRETURN = 0x1000
 
 DT_RIGHT = 0x0002
 DT_TOP = 0x0000
+DT_WORDBREAK = 0x0010
+DT_SINGLELINE = 0x0020
 DT_NOPREFIX = 0x0800
 DT_CALCRECT = 0x0400
 
@@ -944,7 +969,10 @@ class OverlayWindow:
             )
 
     def _get_window_origin(self):
-        return self.screen_width + self.x - self.width, self.y
+        scale = self.screen_height / BASE_SCREEN_HEIGHT if self.screen_height else 1.0
+        scaled_x = int(round(self.x * scale))
+        scaled_y = int(round(self.y * scale))
+        return self.screen_width + scaled_x - self.width, scaled_y
 
     def update_layout(self):
         text = self.text if self.text else " "
@@ -1009,6 +1037,7 @@ class OverlayWindow:
             x=window_x,
             y=window_y,
             right_offset=self.x,
+            scaled_right_offset=window_x + self.width - self.screen_width,
         )
 
     def update_font(self):
@@ -1189,21 +1218,68 @@ class OverlayWindow:
 
 
 class OptionsDialog:
+    INSTRUCTIONS = (
+        "Instructions:\r\n"
+        "- Use {cs} to display the CS count\r\n"
+        "- Use {time} to display the current time (MM:SS)\r\n"
+        "- Use {csmin} to display the CS per minute\r\n"
+        "Multi-line format is allowed."
+    )
+
     def __init__(self, overlay):
         self.overlay = overlay
         self.hwnd = None
         self.controls = {}
 
+    def _measure_text_size(self, text, width=None, wordbreak=False):
+        hdc = user32.GetDC(None)
+        if not hdc:
+            return 0, 0
+        default_font = gdi32.GetStockObject(17)
+        old_font = gdi32.SelectObject(hdc, default_font) if default_font else None
+        rect_width = width if width is not None else 0
+        rect = RECT(0, 0, rect_width, 0)
+        flags = DT_TOP | DT_NOPREFIX | DT_CALCRECT
+        if wordbreak:
+            flags |= DT_WORDBREAK
+        else:
+            flags |= DT_SINGLELINE
+        try:
+            user32.DrawTextW(hdc, text, -1, ctypes.byref(rect), flags)
+            return rect.right - rect.left, rect.bottom - rect.top
+        finally:
+            if old_font:
+                gdi32.SelectObject(hdc, old_font)
+            user32.ReleaseDC(None, hdc)
+
     def _layout_metrics(self):
         margin = 10
-        label_w = 90
         input_w = 100
-        row_h = 22
         row_gap = 4
         section_gap = 6
         format_h = 80
-        instructions_h = 72
-        btn_h = 24
+        label_texts = (
+            "Overlay X:",
+            "Overlay Y:",
+            "Font Size:",
+            "Advanced (ms):",
+            "Update Poll:",
+            "Focus Poll:",
+            "Custom Format:",
+        )
+        label_w = max(
+            90,
+            max(self._measure_text_size(text)[0] for text in label_texts) + 8,
+        )
+        text_height = self._measure_text_size("Ag")[1]
+        row_h = max(22, text_height + 8)
+        btn_h = max(24, text_height + 10)
+        client_width = max(420, margin + label_w + input_w + margin)
+        wide_w = client_width - (margin * 2)
+        instructions_h = max(
+            row_h,
+            self._measure_text_size(self.INSTRUCTIONS, wide_w, wordbreak=True)[1] + 4,
+        )
 
         y = margin
         y += row_h + row_gap
@@ -1225,6 +1301,8 @@ class OptionsDialog:
             "margin": margin,
             "label_w": label_w,
             "input_w": input_w,
+            "wide_w": wide_w,
+            "client_width": client_width,
             "row_h": row_h,
             "row_gap": row_gap,
             "section_gap": section_gap,
@@ -1247,7 +1325,7 @@ class OptionsDialog:
         user32.RegisterClassW(ctypes.byref(wndclass))
 
         metrics = self._layout_metrics()
-        client_width = 420
+        client_width = metrics["client_width"]
         rect = RECT(0, 0, client_width, metrics["client_height"])
         style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU
         user32.AdjustWindowRectEx(ctypes.byref(rect), style, False, 0)
@@ -1282,6 +1360,7 @@ class OptionsDialog:
         margin = metrics["margin"]
         label_w = metrics["label_w"]
         input_w = metrics["input_w"]
+        wide_w = metrics["wide_w"]
         row_h = metrics["row_h"]
         row_gap = metrics["row_gap"]
         section_gap = metrics["section_gap"]
@@ -1338,7 +1417,7 @@ class OptionsDialog:
         self.controls["font"] = add_edit(margin + label_w, y, input_w, row_h, 1003)
         y += row_h + section_gap
 
-        add_label("Advanced (ms):", margin, y, 140, row_h)
+        add_label("Advanced (ms):", margin, y, label_w, row_h)
         y += row_h + row_gap
         add_label("Update Poll:", margin, y, label_w, row_h)
         self.controls["update_ms"] = add_edit(margin + label_w, y, input_w, row_h, 1005)
@@ -1350,18 +1429,11 @@ class OptionsDialog:
         add_label("Custom Format:", margin, y, label_w, row_h)
         y += row_h
         self.controls["format"] = add_edit(
-            margin, y, 380, metrics["format_h"], 1004, multiline=True
+            margin, y, wide_w, metrics["format_h"], 1004, multiline=True
         )
         y += metrics["format_h"] + section_gap
 
-        instructions = (
-            "Instructions:\r\n"
-            "- Use {cs} to display the CS count\r\n"
-            "- Use {time} to display the current time (MM:SS)\r\n"
-            "- Use {csmin} to display the CS per minute\r\n"
-            "Multi-line format is allowed."
-        )
-        add_label(instructions, margin, y, 380, metrics["instructions_h"])
+        add_label(self.INSTRUCTIONS, margin, y, wide_w, metrics["instructions_h"])
 
         btn_y = metrics["btn_y"]
         btn_w = 80
@@ -1419,8 +1491,8 @@ class OptionsDialog:
         )
         user32.SendMessageW(self.controls["cancel"], 0x0030, default_font, 1)
 
-        user32.SetWindowTextW(self.controls["x"], str(self.overlay.x))
-        user32.SetWindowTextW(self.controls["y"], str(self.overlay.y))
+        user32.SetWindowTextW(self.controls["x"], format_number_setting(self.overlay.x))
+        user32.SetWindowTextW(self.controls["y"], format_number_setting(self.overlay.y))
         user32.SetWindowTextW(self.controls["font"], str(self.overlay.font_size))
         user32.SetWindowTextW(
             self.controls["update_ms"], str(self.overlay.update_interval_ms)
@@ -1445,11 +1517,11 @@ class OptionsDialog:
 
     def apply_changes(self):
         try:
-            x = int(self._get_text("x").strip())
+            x = float(self._get_text("x").strip())
         except Exception:
             x = self.overlay.x
         try:
-            y = int(self._get_text("y").strip())
+            y = float(self._get_text("y").strip())
         except Exception:
             y = self.overlay.y
         try:
@@ -1631,8 +1703,8 @@ def main():
     logger.info("Overlay OCR initialized")
 
     config = load_config()
-    overlay_instance.x = config.get("x", overlay_instance.x)
-    overlay_instance.y = config.get("y", overlay_instance.y)
+    overlay_instance.x = parse_float_setting(config.get("x"), overlay_instance.x)
+    overlay_instance.y = parse_float_setting(config.get("y"), overlay_instance.y)
     overlay_instance.custom_format = config.get(
         "custom_format", overlay_instance.custom_format
     )
@@ -1679,8 +1751,8 @@ def main():
     release_single_instance()
 
     config = {
-        "x": overlay_instance.x,
-        "y": overlay_instance.y,
+        "x": normalize_number_setting(overlay_instance.x),
+        "y": normalize_number_setting(overlay_instance.y),
         "custom_format": overlay_instance.custom_format,
         "font_size": overlay_instance.font_size,
         "update_interval_ms": overlay_instance.update_interval_ms,

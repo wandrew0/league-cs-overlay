@@ -4,7 +4,13 @@
 a = Analysis(
     ['CS_Overlay.py'],
     pathex=[],
-    binaries=[],
+    binaries=[
+        ('C:/Users/Andrew/miniforge3/envs/overlay/Library/bin/ffi-8.dll', '.'),
+        ('C:/Users/Andrew/miniforge3/envs/overlay/Library/bin/libbz2.dll', '.'),
+        ('C:/Users/Andrew/miniforge3/envs/overlay/Library/bin/liblzma.dll', '.'),
+        ('C:/Users/Andrew/miniforge3/envs/overlay/Library/bin/libmpdec-4.dll', '.'),
+        ('C:/Users/Andrew/miniforge3/envs/overlay/Library/bin/zstd.dll', '.'),
+    ],
     datas=[('draw.ico', '.')],
     hiddenimports=[],
     hookspath=[],

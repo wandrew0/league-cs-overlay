@@ -1,6 +1,6 @@
 the first startup will take a few seconds idk why maybe because windows defender
 
-WARNING: only for sure works for 1080p (both game and monitor), borderless fullscreen, default ENGLISH font
+WARNING: tested on 1080p and 1440p, borderless fullscreen, default ENGLISH font
 
 ---
 

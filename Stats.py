@@ -41,6 +41,18 @@ logger = logging.getLogger("cs_overlay")
 _winhttp_session = None
 _winhttp_connection = None
 
+BASE_SCREEN_HEIGHT = 1080
+BASE_CAPTURE_LEFT_OFFSET = 138
+BASE_CAPTURE_RIGHT_OFFSET = 108
+BASE_CAPTURE_TOP = 6
+BASE_CAPTURE_BOTTOM = 25
+BASE_DIGIT_TOP = 3
+BASE_DIGIT_WIDTH = 10
+BASE_DIGIT_HEIGHT = 12
+BASE_FIRST_DIGIT_SPACING = 9
+BASE_DIGIT_SPACING = 10
+SCALED_NON_LEADING_OFFSETS = (1, 2)
+
 
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
@@ -203,38 +215,38 @@ class CSOCR:
         self.target_digits = TARGET_DIGITS
         self.counter = 0
         self.prev = 0
+        self.last_capture_signature = None
 
     def get_cs(self, debug=False) -> int:
-        screen_width = user32.GetSystemMetrics(0)
-        left = screen_width - 138
-        top = 6
-        right = screen_width - 108
-        bottom = 25
+        geometry = self._capture_geometry()
+        left = geometry["left"]
+        top = geometry["top"]
+        right = geometry["right"]
+        bottom = geometry["bottom"]
         width = right - left
         height = bottom - top
+        capture_width = width
+        if geometry["scale"] > 1.0:
+            capture_width += max(SCALED_NON_LEADING_OFFSETS)
 
-        data = capture_grayscale(left, top, width, height)
+        self._log_capture_geometry(geometry)
+        data = capture_grayscale(left, top, capture_width, height)
 
-        digits = []
-        x = 0
-        currdigit = self.most_similar_digit(
-            self._extract_digit(
-                data, width, x, digit_top=3, digit_width=10, digit_height=12
-            )
-        )
-        while currdigit != "":
-            digits.append(currdigit)
-            if len(digits) == 1 and currdigit == "1":
-                x += 9
-            else:
-                x += 10
-            currdigit = self.most_similar_digit(
-                self._extract_digit(
-                    data, width, x, digit_top=3, digit_width=10, digit_height=12
+        result = self._read_digits(data, capture_width, geometry, offset_x=0)
+        first_digit = result["digits"][:1]
+        if geometry["scale"] > 1.0 and first_digit not in ("", "1"):
+            candidates = [
+                self._read_digits(data, capture_width, geometry, offset_x=offset)
+                for offset in SCALED_NON_LEADING_OFFSETS
+            ]
+            valid_candidates = [candidate for candidate in candidates if candidate["digits"]]
+            if valid_candidates:
+                result = min(
+                    valid_candidates,
+                    key=lambda candidate: candidate["average_mse"],
                 )
-            )
 
-        string = "".join(digits)
+        string = result["digits"]
         number = int(string) if string else 0
         if debug:
             if number < self.prev or number > self.prev + 1:
@@ -243,6 +255,71 @@ class CSOCR:
         self.prev = number
         return number
 
+    def _capture_geometry(self):
+        screen_width = user32.GetSystemMetrics(0)
+        screen_height = user32.GetSystemMetrics(1)
+        scale = screen_height / BASE_SCREEN_HEIGHT if screen_height else 1.0
+
+        def scaled(value):
+            return max(1, int(round(value * scale)))
+
+        left_offset = scaled(BASE_CAPTURE_LEFT_OFFSET)
+        right_offset = scaled(BASE_CAPTURE_RIGHT_OFFSET)
+        top = scaled(BASE_CAPTURE_TOP)
+        bottom = scaled(BASE_CAPTURE_BOTTOM)
+        digit_width = scaled(BASE_DIGIT_WIDTH)
+        digit_height = scaled(BASE_DIGIT_HEIGHT)
+        left_padding = 1 if scale > 1.0 else 0
+
+        return {
+            "screen_width": screen_width,
+            "screen_height": screen_height,
+            "scale": scale,
+            "left": screen_width - left_offset - left_padding,
+            "top": top,
+            "right": screen_width - right_offset,
+            "bottom": bottom,
+            "left_padding": left_padding,
+            "digit_top": scaled(BASE_DIGIT_TOP),
+            "digit_width": digit_width,
+            "digit_height": digit_height,
+            "first_digit_spacing": scaled(BASE_FIRST_DIGIT_SPACING),
+            "digit_spacing": scaled(BASE_DIGIT_SPACING),
+        }
+
+    def _log_capture_geometry(self, geometry):
+        signature = (
+            geometry["screen_width"],
+            geometry["screen_height"],
+            geometry["left"],
+            geometry["top"],
+            geometry["right"],
+            geometry["bottom"],
+            geometry["left_padding"],
+            geometry["digit_top"],
+            geometry["digit_width"],
+            geometry["digit_height"],
+        )
+        if signature == self.last_capture_signature:
+            return
+        self.last_capture_signature = signature
+        logger.info(
+            "OCR capture geometry screen=%sx%s scale=%.3f bounds=%s,%s,%s,%s left_padding=%s digit_top=%s digit_size=%sx%s spacing=%s/%s",
+            geometry["screen_width"],
+            geometry["screen_height"],
+            geometry["scale"],
+            geometry["left"],
+            geometry["top"],
+            geometry["right"],
+            geometry["bottom"],
+            geometry["left_padding"],
+            geometry["digit_top"],
+            geometry["digit_width"],
+            geometry["digit_height"],
+            geometry["first_digit_spacing"],
+            geometry["digit_spacing"],
+        )
+
     def _extract_digit(self, data, width, x, digit_top, digit_width, digit_height):
         if x < 0 or x + digit_width > width:
             return []
@@ -250,11 +327,81 @@ class CSOCR:
         for row in range(digit_height):
             offset = (digit_top + row) * width + x
             pixels.extend(data[offset : offset + digit_width])
+        if digit_width != BASE_DIGIT_WIDTH or digit_height != BASE_DIGIT_HEIGHT:
+            return self._resize_digit(
+                pixels,
+                digit_width,
+                digit_height,
+                BASE_DIGIT_WIDTH,
+                BASE_DIGIT_HEIGHT,
+            )
         return pixels
 
+    def _read_digits(self, data, width, geometry, offset_x=0):
+        digits = []
+        matches = []
+        x = offset_x
+        currdigit, mse = self._most_similar_digit_with_mse(
+            self._extract_digit(
+                data,
+                width,
+                x,
+                digit_top=geometry["digit_top"],
+                digit_width=geometry["digit_width"],
+                digit_height=geometry["digit_height"],
+            )
+        )
+        while currdigit != "":
+            digits.append(currdigit)
+            matches.append(mse)
+            if len(digits) == 1 and currdigit == "1":
+                x += geometry["first_digit_spacing"]
+            else:
+                x += geometry["digit_spacing"]
+            currdigit, mse = self._most_similar_digit_with_mse(
+                self._extract_digit(
+                    data,
+                    width,
+                    x,
+                    digit_top=geometry["digit_top"],
+                    digit_width=geometry["digit_width"],
+                    digit_height=geometry["digit_height"],
+                )
+            )
+
+        return {
+            "digits": "".join(digits),
+            "offset_x": offset_x,
+            "average_mse": sum(matches) / len(matches) if matches else float("inf"),
+        }
+
+    def _resize_digit(self, pixels, source_width, source_height, target_width, target_height):
+        resized = []
+        for target_y in range(target_height):
+            y0 = int(target_y * source_height / target_height)
+            y1 = int((target_y + 1) * source_height / target_height)
+            y1 = max(y0 + 1, y1)
+            for target_x in range(target_width):
+                x0 = int(target_x * source_width / target_width)
+                x1 = int((target_x + 1) * source_width / target_width)
+                x1 = max(x0 + 1, x1)
+                total = 0
+                count = 0
+                for source_y in range(y0, min(y1, source_height)):
+                    offset = source_y * source_width
+                    for source_x in range(x0, min(x1, source_width)):
+                        total += pixels[offset + source_x]
+                        count += 1
+                resized.append(total // count if count else 0)
+        return resized
+
     def most_similar_digit(self, digit_data) -> str:
+        digit, _mse = self._most_similar_digit_with_mse(digit_data)
+        return digit
+
+    def _most_similar_digit_with_mse(self, digit_data):
         if not digit_data or len(digit_data) != len(self.target_digits[0]):
-            return ""
+            return "", float("inf")
         min_mse = None
         min_index = 0
         for index, target in enumerate(self.target_digits):
@@ -266,7 +413,8 @@ class CSOCR:
             if min_mse is None or mse < min_mse:
                 min_mse = mse
                 min_index = index
-        return str(min_index) if min_index != 10 else ""
+        digit = str(min_index) if min_index != 10 else ""
+        return digit, min_mse
 
 
 def _ensure_winhttp_handles():
