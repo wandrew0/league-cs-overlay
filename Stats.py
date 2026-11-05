@@ -2,6 +2,9 @@ import ctypes
 import ctypes.wintypes as wintypes
 import json
 import logging
+import math
+import threading
+import time
 
 from digits import TARGET_DIGITS
 
@@ -21,8 +24,29 @@ WINHTTP_NO_PROXY_NAME = None
 WINHTTP_NO_PROXY_BYPASS = None
 WINHTTP_NO_REFERER = None
 WINHTTP_DEFAULT_ACCEPT_TYPES = ctypes.POINTER(wintypes.LPCWSTR)()
+WINHTTP_FLAG_ASYNC = 0x10000000
 WINHTTP_FLAG_SECURE = 0x00800000
+WINHTTP_OPTION_CONTEXT_VALUE = 45
 WINHTTP_OPTION_SECURITY_FLAGS = 31
+HTTP_TIMEOUT_MS = 500
+HTTP_BUDGET_SECONDS = 2.0
+HTTP_MAX_RESPONSE_BYTES = 64 * 1024
+WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING = 0x00000800
+WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE = 0x00020000
+WINHTTP_CALLBACK_STATUS_READ_COMPLETE = 0x00080000
+WINHTTP_CALLBACK_STATUS_REQUEST_ERROR = 0x00200000
+WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE = 0x00400000
+HTTP_CALLBACK_FLAGS = (
+    WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING
+    | WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE
+    | WINHTTP_CALLBACK_STATUS_READ_COMPLETE
+    | WINHTTP_CALLBACK_STATUS_REQUEST_ERROR
+    | WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE
+)
+WINHTTP_STATUS_CALLBACK = ctypes.WINFUNCTYPE(
+    None, wintypes.HANDLE, ctypes.c_size_t, wintypes.DWORD,
+    ctypes.c_void_p, wintypes.DWORD,
+)
 
 SECURITY_FLAG_IGNORE_UNKNOWN_CA = 0x00000100
 SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE = 0x00000200
@@ -40,6 +64,8 @@ logger = logging.getLogger("cs_overlay")
 
 _winhttp_session = None
 _winhttp_connection = None
+# Keep async read buffers alive until WinHTTP's final HANDLE_CLOSING callback.
+_http_requests = {}
 
 BASE_SCREEN_HEIGHT = 1080
 BASE_CAPTURE_LEFT_OFFSET = 138
@@ -119,6 +145,12 @@ winhttp.WinHttpOpen.argtypes = [
     wintypes.DWORD,
 ]
 winhttp.WinHttpOpen.restype = wintypes.HANDLE
+winhttp.WinHttpSetTimeouts.argtypes = [wintypes.HANDLE] + [ctypes.c_int] * 4
+winhttp.WinHttpSetTimeouts.restype = wintypes.BOOL
+winhttp.WinHttpSetStatusCallback.argtypes = [
+    wintypes.HANDLE, WINHTTP_STATUS_CALLBACK, wintypes.DWORD, ctypes.c_size_t,
+]
+winhttp.WinHttpSetStatusCallback.restype = ctypes.c_void_p
 winhttp.WinHttpConnect.argtypes = [
     wintypes.HANDLE,
     wintypes.LPCWSTR,
@@ -425,8 +457,14 @@ def _ensure_winhttp_handles():
             WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME,
             WINHTTP_NO_PROXY_BYPASS,
-            0,
+            WINHTTP_FLAG_ASYNC,
         )
+        if _winhttp_session and not winhttp.WinHttpSetTimeouts(
+            _winhttp_session, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS,
+            HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS,
+        ):
+            _close_winhttp_handles()
+            return False
     if _winhttp_session and not _winhttp_connection:
         _winhttp_connection = winhttp.WinHttpConnect(
             _winhttp_session, "127.0.0.1", 2999, 0
@@ -444,12 +482,41 @@ def _close_winhttp_handles():
         _winhttp_session = None
 
 
+@WINHTTP_STATUS_CALLBACK
+def _http_status_callback(handle, context, status, info, length):
+    if status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+        _http_requests.pop(context, None)
+        return
+    state = _http_requests.get(context)
+    if state is not None:
+        state["status"] = status
+        state["length"] = length
+        state["ready"].set()
+
+
 def gettime():
-    """Returns the time in minutes since the start of the game"""
+    """Worker-only blocking interface, with a deadline including the TLS handshake."""
     if not _ensure_winhttp_handles():
-        return 1
+        return None
 
     request = None
+    failed = True
+    deadline = time.monotonic() + HTTP_BUDGET_SECONDS
+    state = {"ready": threading.Event(), "buffer": ctypes.create_string_buffer(8192)}
+    context = id(state)
+
+    def complete(function, expected_status, *args):
+        state["ready"].clear()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Game time request exceeded its time budget")
+        if not function(request, *args):
+            raise OSError("WinHTTP operation failed")
+        if not state["ready"].wait(max(0, deadline - time.monotonic())):
+            raise TimeoutError("Game time request exceeded its time budget")
+        if state["status"] != expected_status:
+            raise OSError("WinHTTP request failed")
+        return state["length"]
+
     try:
         request = winhttp.WinHttpOpenRequest(
             _winhttp_connection,
@@ -461,48 +528,47 @@ def gettime():
             WINHTTP_FLAG_SECURE,
         )
         if not request:
-            return 1
+            return None
 
         security_flags = wintypes.DWORD(WINHTTP_SECURITY_FLAGS)
-        winhttp.WinHttpSetOption(
-            request,
-            WINHTTP_OPTION_SECURITY_FLAGS,
-            ctypes.byref(security_flags),
-            ctypes.sizeof(security_flags),
-        )
+        context_value = ctypes.c_size_t(context)
+        for option, value in (
+            (WINHTTP_OPTION_SECURITY_FLAGS, security_flags),
+            (WINHTTP_OPTION_CONTEXT_VALUE, context_value),
+        ):
+            if not winhttp.WinHttpSetOption(request, option, ctypes.byref(value), ctypes.sizeof(value)):
+                raise OSError("Could not configure WinHTTP request")
+        _http_requests[context] = state
+        previous = winhttp.WinHttpSetStatusCallback(request, _http_status_callback, HTTP_CALLBACK_FLAGS, 0)
+        if previous == ctypes.c_void_p(-1).value:
+            _http_requests.pop(context, None)
+            raise OSError("Could not register WinHTTP callback")
 
-        if not winhttp.WinHttpSendRequest(request, None, 0, None, 0, 0, None):
-            _close_winhttp_handles()
-            return 1
-        if not winhttp.WinHttpReceiveResponse(request, None):
-            _close_winhttp_handles()
-            return 1
-
+        # Async WinHTTP permits safe cancellation after a bounded worker wait.
+        # Closing a handle from another thread during a synchronous call is unsafe.
+        complete(winhttp.WinHttpSendRequest, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE,
+                 None, 0, None, 0, 0, context)
+        complete(winhttp.WinHttpReceiveResponse, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, None)
         chunks = bytearray()
-        available = wintypes.DWORD()
-        bytes_read = wintypes.DWORD()
         while True:
-            available.value = 0
-            if not winhttp.WinHttpQueryDataAvailable(request, ctypes.byref(available)):
-                _close_winhttp_handles()
-                return 1
-            if not available.value:
+            count = complete(winhttp.WinHttpReadData, WINHTTP_CALLBACK_STATUS_READ_COMPLETE,
+                             state["buffer"], len(state["buffer"]), None)
+            if not count:
                 break
-            buffer = ctypes.create_string_buffer(available.value)
-            bytes_read.value = 0
-            if not winhttp.WinHttpReadData(
-                request, buffer, available.value, ctypes.byref(bytes_read)
-            ):
-                _close_winhttp_handles()
-                return 1
-            chunks.extend(buffer.raw[: bytes_read.value])
+            if len(chunks) + count > HTTP_MAX_RESPONSE_BYTES:
+                raise ValueError("Game time response is too large")
+            chunks.extend(state["buffer"].raw[:count])
 
-        payload = json.loads(chunks.decode("utf-8"))
-        return payload.get("gameTime", 0) / 60
+        minutes = float(json.loads(chunks.decode("utf-8"))["gameTime"]) / 60
+        if not math.isfinite(minutes) or minutes < 0:
+            raise ValueError("Invalid game time")
+        failed = False
+        return minutes
     except Exception as exc:
         logger.debug("WinHTTP game time request failed: %s", exc)
-        _close_winhttp_handles()
-        return 1
+        return None
     finally:
         if request:
             winhttp.WinHttpCloseHandle(request)
+        if failed:
+            _close_winhttp_handles()

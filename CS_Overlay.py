@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 
-from Stats import CSOCR, gettime
+from Stats import CSOCR, gettime, _close_winhttp_handles
 
 
 try:
@@ -121,6 +121,7 @@ def normalize_number_setting(value):
     return int(number) if number.is_integer() else number
 
 
+SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_NOSENDCHANGING = 0x0400
@@ -142,6 +143,7 @@ WM_DWMCOMPOSITIONCHANGED = 0x031E
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
 WM_FOCUS_CHANGED = WM_APP + 2
+WM_STATS_READY = WM_APP + 3
 WM_CTLCOLORSTATIC = 0x0138
 WM_CTLCOLOREDIT = 0x0133
 
@@ -151,6 +153,7 @@ TIMER_UPDATE = 1
 TIMER_FOCUS_POLL = 2
 TIMER_POST_SHOW_CHECK = 3
 POST_SHOW_CHECK_MS = 250
+STATS_MAX_AGE_SECONDS = 3.0
 
 EVENT_SYSTEM_FOREGROUND = 0x0003
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -322,6 +325,8 @@ user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindow.restype = wintypes.BOOL
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.IsWindowVisible.restype = wintypes.BOOL
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowLongW.restype = wintypes.LONG
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -488,6 +493,7 @@ gdi32.BitBlt.restype = wintypes.BOOL
 overlay_instance = None
 options_dialog = None
 league_focused = False
+league_window = None
 single_instance_mutex = None
 
 options_bg_brush = user32.GetSysColorBrush(COLOR_BTNFACE)
@@ -723,33 +729,34 @@ def is_league_window(hwnd):
     return process_name in LEAGUE_PROCESS_NAMES
 
 
-def update_focus_state(is_focused):
-    global league_focused
-    if is_focused != league_focused:
-        league_focused = is_focused
-        logger.info("League focus changed focused=%s", is_focused)
-        if overlay_instance and overlay_instance.hwnd:
-            user32.PostMessageW(
-                overlay_instance.hwnd, WM_FOCUS_CHANGED, 1 if is_focused else 0, 0
-            )
-
-
 def check_league_focus():
+    # Only the UI thread owns focus state and the sampling generation.
+    global league_focused, league_window
     hwnd = user32.GetForegroundWindow()
-    update_focus_state(is_league_window(hwnd))
+    window = None
+    if hwnd and not user32.IsIconic(hwnd) and is_league_window(hwnd):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        window = (hwnd, pid.value)
+    if window != league_window:
+        league_window = window
+        league_focused = window is not None
+        logger.info("League focus changed window=%s", window)
+        if overlay_instance:
+            overlay_instance.stats_generation += 1
+            if league_focused:
+                overlay_instance.window_state = None
+                overlay_instance.show()
+            else:
+                overlay_instance.hide()
 
 
 def detection_callback(
     hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime
 ):
-    if event == EVENT_SYSTEM_FOREGROUND:
-        logger.info(
-            "Foreground window changed hwnd=0x%X title=%r process=%r",
-            int(hwnd) if hwnd else 0,
-            get_window_title(hwnd),
-            get_process_name(hwnd),
-        )
-        update_focus_state(is_league_window(hwnd))
+    if event == EVENT_SYSTEM_FOREGROUND and overlay_instance and overlay_instance.hwnd:
+        # Re-read the current foreground on the UI thread; queued events can be old.
+        user32.PostMessageW(overlay_instance.hwnd, WM_FOCUS_CHANGED, 0, 0)
 
 
 win_event_proc = WINEVENTPROC(detection_callback)
@@ -780,6 +787,69 @@ def detection_thread():
         user32.UnhookWinEvent(hook)
 
 
+class StatsWorker:
+    """One in-flight sample, including its unconsumed result; never queues a backlog."""
+
+    def __init__(self, hwnd):
+        self.hwnd = hwnd
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.closed = False
+        self.busy = False
+        self.job = None
+        self.result = None
+        self.thread = threading.Thread(target=self.run, daemon=True, name="stats-worker")
+        self.thread.start()
+
+    def request(self, generation, focused):
+        with self.lock:
+            if self.closed or self.busy:
+                return
+            self.busy = True
+            self.job = (generation, focused, time.monotonic())
+            self.wake.set()
+
+    def take_result(self):
+        with self.lock:
+            result, self.result = self.result, None
+            if result is not None:
+                self.busy = False
+            return result
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            self.result = None
+            self.wake.set()
+
+    def run(self):
+        ocr = CSOCR()
+        try:
+            while self.wake.wait():
+                with self.lock:
+                    if self.closed:
+                        return
+                    generation, focused, started = self.job
+                    self.wake.clear()
+                sample = None
+                try:
+                    sample = (ocr.get_cs(), gettime() if focused else 1)
+                except Exception:
+                    logger.exception("Stats sample failed")
+                with self.lock:
+                    if self.closed:
+                        return
+                    self.result = (generation, started, sample)
+                    # close() serializes with this post before the HWND is destroyed.
+                    if not user32.PostMessageW(self.hwnd, WM_STATS_READY, 0, 0):
+                        self.result = None
+                        self.busy = False
+                        logger.warning("Could not post stats result")
+        finally:
+            # WinHTTP requests and handle cleanup belong to this worker.
+            _close_winhttp_handles()
+
+
 class OverlayWindow:
     def __init__(self):
         self.hwnd = None
@@ -804,7 +874,11 @@ class OverlayWindow:
         self.padding_y = 6
         self.tray_icon = None
         self.tray_nid = None
-        self.ocr = None
+        self.worker = None
+        self.stats_generation = 0
+        self.closed = False
+        self.window_state = None
+        self.layered_ready = False
         self.last_paint_monotonic = 0.0
         self.last_show_monotonic = 0.0
         self.last_show_reason = "startup"
@@ -1003,8 +1077,17 @@ class OverlayWindow:
         self.refresh_metrics()
         self.update_layout()
         window_x, window_y = self._get_window_origin()
+        state = (window_x, window_y, self.width, self.height, show_window)
+        if state == self.window_state and self.layered_ready:
+            return
+        showing = show_window and (self.window_state is None or not self.window_state[-1])
+        flags = SWP_NOACTIVATE | SWP_NOSENDCHANGING
+        if showing:
+            flags |= SWP_SHOWWINDOW
+        elif self.window_state is not None:
+            flags |= SWP_NOZORDER
         kernel32.SetLastError(0)
-        if not user32.SetLayeredWindowAttributes(
+        if not self.layered_ready and not user32.SetLayeredWindowAttributes(
             self.hwnd, rgb(0, 0, 0), 0, LWA_COLORKEY
         ):
             logger.warning(
@@ -1012,6 +1095,8 @@ class OverlayWindow:
                 format_last_error(),
             )
             self.log_state_snapshot("SetLayeredWindowAttributes_failed", level=logging.WARNING)
+        else:
+            self.layered_ready = True
         kernel32.SetLastError(0)
         if not user32.SetWindowPos(
             self.hwnd,
@@ -1020,12 +1105,12 @@ class OverlayWindow:
             window_y,
             self.width,
             self.height,
-            SWP_NOACTIVATE
-            | SWP_NOSENDCHANGING
-            | (SWP_SHOWWINDOW if show_window else 0),
+            flags,
         ):
             logger.warning("SetWindowPos failed last_error=%s", format_last_error())
             self.log_state_snapshot("SetWindowPos_failed", level=logging.WARNING)
+        else:
+            self.window_state = state
         log_window_event(
             "Overlay window refreshed",
             self.hwnd,
@@ -1060,17 +1145,21 @@ class OverlayWindow:
         else:
             logger.info("Overlay font updated font_size=%s dpi=%s", self.font_size, dpi)
         self.update_layout()
+        if self.expected_visible():
+            user32.InvalidateRect(self.hwnd, None, True)
 
     def update_position(self):
         self.refresh_window_state(show_window=self.visible or self.force_visible)
 
     def show(self):
+        if self.closed:
+            return
+        if self.visible and self.window_state is not None and self.window_state[-1]:
+            return
         self.visible = True
         self.last_show_monotonic = time.monotonic()
         self.last_show_reason = "show"
         self.refresh_window_state(show_window=True)
-        kernel32.SetLastError(0)
-        user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         log_window_event(
             "Overlay show requested",
             self.hwnd,
@@ -1089,6 +1178,11 @@ class OverlayWindow:
         user32.SetTimer(self.hwnd, TIMER_FOCUS_POLL, self.focus_poll_interval_ms, None)
 
     def hide(self):
+        if self.force_visible or not self.visible:
+            return
+        self.stats_generation += 1
+        if self.window_state is not None:
+            self.window_state = self.window_state[:-1] + (False,)
         self.last_hide_reason = "hide"
         user32.KillTimer(self.hwnd, TIMER_POST_SHOW_CHECK)
         if not self.force_visible:
@@ -1103,20 +1197,41 @@ class OverlayWindow:
             )
 
     def update_display(self):
-        if not self.ocr:
+        if self.worker and not self.closed and self.expected_visible():
+            self.worker.request(self.stats_generation, league_focused)
+
+    def apply_stats_result(self):
+        if self.closed or not self.worker:
             return
-        cs_value = self.ocr.get_cs()
-        current_time = gettime() if league_focused else 1
-        minutes = int(current_time)
-        seconds = int((current_time % 1) * 60)
-        cs_per_min = cs_value / current_time if current_time > 0 else 0
+        # Catch a missed/delayed foreground notification before accepting a sample.
+        check_league_focus()
+        result = self.worker.take_result()
+        if result is None:
+            return
+        generation, started, sample = result
+        if (
+            generation != self.stats_generation
+            or time.monotonic() - started > STATS_MAX_AGE_SECONDS
+            or not self.expected_visible()
+        ):
+            self.update_display()
+            return
+        if sample is not None:
+            self.render_stats(*sample)
+
+    def render_stats(self, cs_value, current_time):
+        minutes = int(current_time) if current_time is not None else 0
+        seconds = int((current_time % 1) * 60) if current_time is not None else 0
+        cs_per_min = cs_value / current_time if current_time and current_time > 0 else 0
+        time_text = f"{minutes}:{seconds:02d}" if current_time is not None else "--:--"
+        csmin_text = f"{cs_per_min:.1f}" if current_time is not None else "--"
 
         if self.custom_format:
             try:
                 text = self.custom_format.format(
                     cs=cs_value,
-                    time=f"{minutes}:{seconds:02d}",
-                    csmin=f"{cs_per_min:.1f}",
+                    time=time_text,
+                    csmin=csmin_text,
                 )
             except Exception:
                 text = "Format error"
@@ -1125,16 +1240,16 @@ class OverlayWindow:
             if self.show_cs:
                 lines.append(str(cs_value))
             if self.show_time:
-                lines.append(f"{minutes}:{seconds:02d}")
+                lines.append(time_text)
             if self.show_csmin:
-                lines.append(f"{cs_per_min:.1f}")
+                lines.append(csmin_text)
             text = "\n".join(lines)
 
+        if text == self.text:
+            return
         self.text = text
-        self.update_layout()
         if self.visible or self.force_visible:
             self.refresh_window_state(show_window=True)
-            self.schedule_post_show_check()
         if self.visible or self.force_visible:
             if not user32.InvalidateRect(self.hwnd, None, True):
                 logger.warning("InvalidateRect failed last_error=%s", format_last_error())
@@ -1152,6 +1267,9 @@ class OverlayWindow:
 
     def handle_system_change(self, reason):
         logger.info("System change received reason=%s", reason)
+        self.stats_generation += 1
+        self.window_state = None
+        self.layered_ready = False
         self.refresh_metrics()
         self.update_font()
         if self.visible or self.force_visible:
@@ -1160,6 +1278,16 @@ class OverlayWindow:
             self.update_display()
         else:
             self.refresh_window_state(show_window=False)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.stats_generation += 1
+        if self.worker:
+            self.worker.close()
+        for timer in (TIMER_UPDATE, TIMER_FOCUS_POLL, TIMER_POST_SHOW_CHECK):
+            user32.KillTimer(self.hwnd, timer)
 
     def on_paint(self):
         ps = PAINTSTRUCT()
@@ -1548,8 +1676,8 @@ class OptionsDialog:
         self.overlay.font_size = font
         self.overlay.update_interval_ms = update_ms
         self.overlay.focus_poll_interval_ms = focus_ms
-        self.overlay.update_position()
         self.overlay.update_font()
+        self.overlay.update_position()
         self.overlay.apply_timers()
         self.overlay.update_display()
 
@@ -1560,6 +1688,7 @@ def open_options():
         logger.info("Options already open; foregrounding existing dialog")
         user32.SetForegroundWindow(options_dialog.hwnd)
         return
+    overlay_instance.stats_generation += 1
     overlay_instance.force_visible = True
     logger.info("Opening options dialog and forcing overlay visible")
     overlay_instance.show()
@@ -1608,10 +1737,12 @@ def overlay_wndproc(hwnd, msg, wparam, lparam):
             user32.DestroyMenu(menu)
         return 0
     if msg == WM_FOCUS_CHANGED:
-        if wparam:
-            overlay_instance.show()
-        else:
-            overlay_instance.hide()
+        # Invalidate even for a rapid switch away and back to the same game HWND.
+        overlay_instance.stats_generation += 1
+        check_league_focus()
+        return 0
+    if msg == WM_STATS_READY:
+        overlay_instance.apply_stats_result()
         return 0
     if msg in (WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE, WM_DWMCOMPOSITIONCHANGED):
         message_name = {
@@ -1623,10 +1754,13 @@ def overlay_wndproc(hwnd, msg, wparam, lparam):
         overlay_instance.handle_system_change(message_name)
         return 0
     if msg == WM_CLOSE:
+        overlay_instance.close()
         user32.DestroyWindow(hwnd)
         return 0
     if msg == WM_DESTROY:
+        overlay_instance.close()
         overlay_instance.remove_tray()
+        overlay_instance.hwnd = None
         user32.PostQuitMessage(0)
         return 0
     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1664,6 +1798,7 @@ def options_wndproc(hwnd, msg, wparam, lparam):
         return 0
     if msg == WM_DESTROY:
         options_dialog = None
+        overlay_instance.stats_generation += 1
         overlay_instance.force_visible = False
         if not league_focused:
             overlay_instance.hide()
@@ -1699,8 +1834,8 @@ def main():
     global overlay_instance
     overlay_instance = OverlayWindow()
     overlay_instance.create_window()
-    overlay_instance.ocr = CSOCR()
-    logger.info("Overlay OCR initialized")
+    overlay_instance.worker = StatsWorker(overlay_instance.hwnd)
+    logger.info("Stats worker started")
 
     config = load_config()
     overlay_instance.x = parse_float_setting(config.get("x"), overlay_instance.x)
@@ -1748,6 +1883,7 @@ def main():
         result = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
     if result == -1:
         logger.error("Main loop GetMessageW failed last_error=%s", format_last_error())
+    overlay_instance.close()
     release_single_instance()
 
     config = {
